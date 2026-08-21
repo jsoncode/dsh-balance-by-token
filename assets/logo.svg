@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none">
+  <!-- dsh-balance-by-token logo: 钱包 + 货币符号（余额主题） -->
+  <rect x="6" y="14" width="48" height="38" rx="8" stroke="#4f8cff" stroke-width="4"/>
+  <path d="M6 24h48" stroke="#4f8cff" stroke-width="4" stroke-linecap="round"/>
+  <rect x="40" y="30" width="22" height="14" rx="5" fill="#4f8cff"/>
+  <circle cx="51" cy="37" r="3" fill="#ffffff"/>
+  <path d="M18 40l5 5 5-5M23 45V33M18 33h10" stroke="#4f8cff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

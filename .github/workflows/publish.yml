@@ -1,0 +1,59 @@
+# 发布工作流：推送 v* tag 时触发
+# - release job：安装依赖（pnpm frozen-lockfile）+ 类型检查（tsc -b）+ 构建（tsc -b && tsdown）→ 打包并直接创建 GitHub Release（非草稿）→ 自动通过 OIDC 凭证发布至 npm
+#
+# 注意：setup-node@v5 必须显式关闭 package-manager-cache（默认开启会读取
+# package.json 的 packageManager 字段并执行 `pnpm store path`，而该步骤执行时
+# pnpm 尚未安装，node 26 不再捆绑 corepack，导致 "Unable to locate executable
+# file: pnpm"）。pnpm 由后续步骤经 npx 临时调用，无需缓存恢复。
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 用于创建 GitHub Release
+      id-token: write   # 必须！用于通过 OIDC 与 npm 进行身份安全验证
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 26
+          package-manager-cache: false
+
+      - name: Install dependencies
+        # 用 npx 直接调用 pnpm：版本与 package.json 的 packageManager 字段一致。
+        run: npx --yes pnpm@10.33.0 install --frozen-lockfile
+
+      - name: Type check
+        run: npx --yes pnpm@10.33.0 run check
+
+      - name: Build
+        run: npx --yes pnpm@10.33.0 run build
+
+      - name: Verify bundle
+        run: npx --yes pnpm@10.33.0 run verify
+
+      - name: Pack tarball
+        run: npx --yes pnpm@10.33.0 pack
+
+      - name: Create GitHub Release (published, not draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --verify-tag \
+            *.tgz
+
+      - name: Publish to npm via Trusted Publishing
+        # --provenance 将发布行为绑定到工作流凭证；--no-git-checks 跳过工作区检查。
+        run: npm publish --provenance --no-git-checks
