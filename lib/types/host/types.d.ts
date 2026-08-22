@@ -94,20 +94,31 @@ export interface ProviderBalance {
     is_available?: boolean;
     balance_infos?: BalanceInfo[];
 }
+/**
+ * 单个 API key（服务商条目）的用量与费用明细。
+ * token 四桶不区分官方与否（一律统计数量）；费用只对官方 key（api.deepseek.com）计算。
+ */
+export interface KeyCostEntry {
+    /** 服务商路由 key（会话事件 request/context 的 provider）。 */
+    provider: string;
+    /** 该 key 的全部 token 四桶（不区分官方与否，仅统计数量）。 */
+    buckets: UsageBuckets;
+    /** 是否 DeepSeek 官方（baseURL 域名 == api.deepseek.com）。 */
+    official: boolean;
+    /** 官方计费金额；非官方恒为 0。 */
+    amount: number;
+    /** 官方计费币种；非官方为空串。 */
+    currency: string;
+}
 /** 一项费用统计（金额 + 桶明细 + 生效档位摘要）。 */
 export interface CostEntry {
     /** 金额（仅 DeepSeek 官方 api.deepseek.com 请求计费）；无用量时为 0。 */
     amount: number;
     currency: string;
-    /** 全量 token 用量（官方 + 所有非官方服务商，仅统计数量）。 */
+    /** 全量 token 用量（所有 key 合计，不区分官方与否，仅统计数量）。 */
     buckets: UsageBuckets;
-    /** DeepSeek 官方（api.deepseek.com）用量四桶。 */
-    official: UsageBuckets;
-    /** 非官方服务商列表（可能多条）：每个服务商一组四桶，各自展示、互不合并。 */
-    nonOfficialByProvider: Array<{
-        provider: string;
-        buckets: UsageBuckets;
-    }>;
+    /** 按 API key（服务商条目）分组的明细，token 总数降序。 */
+    byKey: KeyCostEntry[];
 }
 /** cost op 的返回载荷。 */
 export interface CostResult {

@@ -6,7 +6,7 @@
  *    每行独立状态；底部「附加 API Key」管理不在 providers 配置中的 key；
  * 2. 费用：四卡片 —— 最近一次提问 / 本会话 / 今日·本项目 / 今日·全部，
  *    金额 + 四桶 token 明细 + 当前生效价格档；
- * 3. 价格设置：价格档行内编辑 + 增删 + 恢复官方默认。
+ * 3. 价格设置：价格档行内编辑 + 增删。
  */
 import type { RunFn } from '../rpc.ts';
 export interface BalanceModalProps {

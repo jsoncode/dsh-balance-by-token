@@ -6,7 +6,7 @@
  *    每行独立状态；底部「附加 API Key」管理不在 providers 配置中的 key；
  * 2. 费用：四卡片 —— 最近一次提问 / 本会话 / 今日·本项目 / 今日·全部，
  *    金额 + 四桶 token 明细 + 当前生效价格档；
- * 3. 价格设置：价格档行内编辑 + 增删 + 恢复官方默认。
+ * 3. 价格设置：价格档行内编辑 + 增删。
  */
 
 import { Fragment, useCallback, useEffect, useState } from 'react'
@@ -48,19 +48,21 @@ interface BucketsView {
   output: number
 }
 
+/** 单个 API Key 的用量与费用明细（token 不区分官方与否；费用只对官方计算）。 */
+interface KeyCostEntryView {
+  provider: string
+  buckets: BucketsView
+  official: boolean
+  amount: number
+  currency: string
+}
+
 interface CostEntryView {
   amount: number
   currency: string
   buckets: BucketsView
-  /** DeepSeek 官方（api.deepseek.com）用量四桶。 */
-  official: BucketsView
-  /** 非官方服务商列表（可多条）：各自四桶，不合并。 */
-  nonOfficialByProvider: Array<{ provider: string; buckets: BucketsView }>
-}
-
-interface NonOfficialProviderView {
-  provider: string
-  buckets: BucketsView
+  /** 按 API Key（服务商条目）分组的明细，token 总数降序。 */
+  byKey: KeyCostEntryView[]
 }
 
 interface CostResultView {
@@ -187,9 +189,7 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
   const [costLoading, setCostLoading] = useState(false)
   // 价格 tab
   const [prices, setPrices] = useState<PriceView[] | null>(null)
-  const [defaults, setDefaults] = useState<PriceView[]>([])
   const [windowCfg, setWindowCfg] = useState<PriceWindowView>({ timezoneOffsetMinutes: 480, peakWindows: [] })
-  const [defaultWindow, setDefaultWindow] = useState<PriceWindowView>({ timezoneOffsetMinutes: 480, peakWindows: [] })
   const [priceMsg, setPriceMsg] = useState('')
 
   /** 余额查询：providers 与 balances 一并回填。 */
@@ -233,19 +233,11 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
     const res = await run(getSession(), { op: 'pricesGet' })
     if (res.ok) {
       const config = res.config as { tiers?: PriceView[]; timezoneOffsetMinutes?: number; peakWindows?: TimeWindowView[] } | undefined
-      const def = res.defaults as { tiers?: PriceView[]; timezoneOffsetMinutes?: number; peakWindows?: TimeWindowView[] } | undefined
       if (Array.isArray(config?.tiers)) setPrices(config.tiers as PriceView[])
-      if (Array.isArray(def?.tiers)) setDefaults(def.tiers as PriceView[])
       if (config !== undefined) {
         setWindowCfg({
           timezoneOffsetMinutes: typeof config.timezoneOffsetMinutes === 'number' ? config.timezoneOffsetMinutes : 480,
           peakWindows: Array.isArray(config.peakWindows) ? config.peakWindows as TimeWindowView[] : [],
-        })
-      }
-      if (def !== undefined) {
-        setDefaultWindow({
-          timezoneOffsetMinutes: typeof def.timezoneOffsetMinutes === 'number' ? def.timezoneOffsetMinutes : 480,
-          peakWindows: Array.isArray(def.peakWindows) ? def.peakWindows as TimeWindowView[] : [],
         })
       }
     }
@@ -370,17 +362,20 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
     }
   }
 
-  const restoreDefaults = (): void => {
-    if (defaults.length === 0) return
-    if (!window.confirm(t('confirmRestore'))) return
-    const clone = defaults.map((d) => ({ id: d.id, name: d.name, currency: d.currency, match: d.match, peak: { ...d.peak }, offPeak: { ...d.offPeak } }))
-    setWindowCfg({ timezoneOffsetMinutes: defaultWindow.timezoneOffsetMinutes, peakWindows: defaultWindow.peakWindows.map((w) => ({ ...w })) })
-    void savePrices(clone, { timezoneOffsetMinutes: defaultWindow.timezoneOffsetMinutes, peakWindows: defaultWindow.peakWindows.map((w) => ({ ...w })) })
-  }
-
   /* ── 渲染 ── */
 
   const balanceOf = (id: string): BalanceView | undefined => balances[id]
+
+  /**
+   * 单个服务商条目（API key）的今日消耗：从 cost.todayAll.byKey 按
+   * 服务商路由匹配（pi-ai:<route> / llm-deepseek:<route> / label）。
+   * 无用量时返回 undefined，展示为 ≈0.00 CNY。
+   */
+  const todayCostOf = (p: ProviderView): KeyCostEntryView | undefined => {
+    const list = cost?.todayAll?.byKey ?? []
+    return list.find((k) =>
+      'pi-ai:' + k.provider === p.id || 'llm-deepseek:' + k.provider === p.id || k.provider === p.id || k.provider === p.label)
+  }
 
   const renderBalanceTab = () => (
     <div>
@@ -418,18 +413,25 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
                         : b.ok
                           ? infos.length === 0
                             ? <span className="dshb-prov-sub">—</span>
-                            : infos.map((info, i) => (
-                              <div key={i}>
-                                <div className="dshb-prov-amount">
-                                  {info.total_balance}
-                                  <span className="dshb-prov-sub"> {info.currency}</span>
+                            : infos.map((info, i) => {
+                              const kc = todayCostOf(p)
+                              const kcCurrency = kc !== undefined && kc.currency !== '' ? kc.currency : 'CNY'
+                              return (
+                                <div key={i}>
+                                  <div className="dshb-prov-costline">
+                                    <span>{t('summaryTodayCost')}</span>
+                                    <span className="dshb-balance-num">≈{fmtAmount(kc?.amount ?? 0)} {kcCurrency}</span>
+                                    <span className="dshb-balance-sep">|</span>
+                                    <span>{t('summaryBalance')}</span>
+                                    <span className="dshb-balance-num">{info.total_balance} {info.currency}</span>
+                                  </div>
+                                  <div className={'dshb-prov-sub' + (info.topped_out ? ' dshb-topped' : '')}>
+                                    {t('balanceGranted')} {info.granted_balance}
+                                    {info.topped_out ? ` · ${t('toppedOut')}` : ''}
+                                  </div>
                                 </div>
-                                <div className={'dshb-prov-sub' + (info.topped_out ? ' dshb-topped' : '')}>
-                                  {t('balanceGranted')} {info.granted_balance}
-                                  {info.topped_out ? ` · ${t('toppedOut')}` : ''}
-                                </div>
-                              </div>
-                            ))
+                              )
+                            })
                           : <div className="dshb-prov-err">{tErr(b)}</div>}
                     </div>
                   </div>
@@ -465,10 +467,46 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
     </div>
   )
 
+  /** 服务商路由 key → 展示信息（label + 脱敏 key）；用余额 tab 已加载的 providers 列表匹配。 */
+  const providerMeta = (provider: string): { label: string; masked?: string } => {
+    const hit = (providers ?? []).find((p) =>
+      p.id === 'pi-ai:' + provider || p.id === 'llm-deepseek:' + provider || p.id === provider || p.label === provider)
+    if (hit !== undefined) return { label: hit.label !== '' ? hit.label : provider, ...hit.apiKeyMasked !== undefined && hit.apiKeyMasked !== '' ? { masked: hit.apiKeyMasked } : {} }
+    return { label: provider }
+  }
+
+  /** 一条 token 四段柱状图（纯 div）。 */
+  const usageBar = (buckets: BucketsView, small: boolean) => {
+    const total = totalTokensView(buckets)
+    return (
+      <div
+        className={'dshb-bar' + (small ? ' dshb-bar-sm' : '')}
+        role="img"
+        aria-label={TOKEN_SEGMENTS.map((s) => t(s.labelKey) + ': ' + fmtTokens(buckets[s.key])).join(', ')}
+      >
+        {total > 0
+          ? TOKEN_SEGMENTS.map((seg) => {
+            const v = buckets[seg.key]
+            return v > 0
+              ? (
+                <div
+                  key={seg.key}
+                  className="dshb-bar-seg"
+                  style={{ width: (v / total * 100) + '%', background: seg.color }}
+                  title={t(seg.labelKey) + ': ' + fmtTokens(v)}
+                />
+              )
+              : null
+          })
+          : null}
+      </div>
+    )
+  }
+
   const costCard = (label: string, entry: CostEntryView | undefined) => {
-    const official: BucketsView = entry?.official ?? { uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
-    const officialTotal = totalTokensView(official)
-    const nonOfficialList: NonOfficialProviderView[] = entry?.nonOfficialByProvider ?? []
+    const byKey: KeyCostEntryView[] = entry?.byKey ?? []
+    const total: BucketsView = entry?.buckets ?? { uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
+    const totalTokens = totalTokensView(total)
     return (
       <div className="dshb-cost-card">
         <div className="dshb-cost-label">{label}</div>
@@ -481,30 +519,9 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
                 <span className="dshb-cost-currency">{entry.currency}</span>
               </div>
 
-              {/* ── 官方（api.deepseek.com）：柱状图 + 图例 ── */}
-              <div className="dshb-official-title">{t('officialLabel')}</div>
-              {officialTotal > 0
-                ? (
-                  <div
-                    className="dshb-bar"
-                    role="img"
-                    aria-label={TOKEN_SEGMENTS.map((s) => t(s.labelKey) + ': ' + fmtTokens(official[s.key])).join(', ')}
-                  >
-                    {TOKEN_SEGMENTS.map((seg) => {
-                      const v = official[seg.key]
-                      return v > 0
-                        ? (
-                          <div
-                            key={seg.key}
-                            className="dshb-bar-seg"
-                            style={{ width: (v / officialTotal * 100) + '%', background: seg.color }}
-                            title={t(seg.labelKey) + ': ' + fmtTokens(v)}
-                          />
-                        )
-                        : null
-                    })}
-                  </div>
-                )
+              {/* ── 合计：全部 API Key 的 token 柱状图 + 图例（不区分官方与否） ── */}
+              {totalTokens > 0
+                ? usageBar(total, false)
                 : <div className="dshb-bar dshb-bar-empty">{t('noUsage')}</div>}
               <div className="dshb-bar-legend">
                 {TOKEN_SEGMENTS.map((seg) => (
@@ -513,50 +530,34 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
                       <i style={{ background: seg.color }} />
                       {t(seg.labelKey)}
                     </span>
-                    <b>{fmtTokens(official[seg.key])}</b>
+                    <b>{fmtTokens(total[seg.key])}</b>
                   </span>
                 ))}
               </div>
 
-              {/* ── 非官方（不计费）：多条服务商列表，各自柱状图 ── */}
-              {nonOfficialList.length > 0
+              {/* ── 按 API Key 分行：token 各自统计；费用仅官方 Key（api.deepseek.com）计算 ── */}
+              {byKey.length > 0
                 ? (
-                  <div className="dshb-nonofficial-bar">
-                    <div className="dshb-nonofficial-title">{t('nonOfficialLabel')}</div>
-                    {nonOfficialList.map((item) => {
-                      const itemTotal = totalTokensView(item.buckets)
-                      if (itemTotal <= 0) return null
+                  <div className="dshb-key-cost-list">
+                    <div className="dshb-nonofficial-title">{t('costByKeyTitle')}</div>
+                    {byKey.map((k) => {
+                      const meta = providerMeta(k.provider)
                       return (
-                        <div className="dshb-provider-row" key={item.provider}>
-                          <span className="dshb-provider-name">{item.provider}</span>
-                          <div
-                            className="dshb-bar dshb-bar-sm dshb-bar-flex"
-                            role="img"
-                            aria-label={TOKEN_SEGMENTS
-                              .filter((seg) => item.buckets[seg.key] > 0)
-                              .map((seg) => t(seg.labelKey) + ': ' + fmtTokens(item.buckets[seg.key]))
-                              .join(', ')}
-                          >
-                            {TOKEN_SEGMENTS.map((seg) => {
-                              const v = item.buckets[seg.key]
-                              return v > 0
-                                ? (
-                                  <div
-                                    key={seg.key}
-                                    className="dshb-bar-seg"
-                                    style={{ width: (v / itemTotal * 100) + '%', background: seg.color }}
-                                    title={t(seg.labelKey) + ': ' + fmtTokens(v)}
-                                  />
-                                )
-                                : null
-                            })}
+                        <div className="dshb-key-cost" key={k.provider}>
+                          <div className="dshb-key-cost-head">
+                            <span className="dshb-key-cost-name" title={k.provider}>{meta.label}</span>
+                            {meta.masked !== undefined ? <span className="dshb-key-cost-mask">{meta.masked}</span> : null}
+                            <span className={'dshb-chip' + (k.official ? ' dshb-chip-brand' : '')}>
+                              {k.official ? t('chipOfficial') : t('chipNonOfficial')}
+                            </span>
+                            {k.official
+                              ? <span className="dshb-key-cost-amount">≈{fmtAmount(k.amount)} {k.currency}</span>
+                              : <span className="dshb-chip">{t('notBilled')}</span>}
                           </div>
-                          <span className="dshb-provider-counts">
-                            {TOKEN_SEGMENTS
-                              .filter((seg) => item.buckets[seg.key] > 0)
-                              .map((seg) => t(seg.labelKey) + ' ' + fmtTokens(item.buckets[seg.key]))
-                              .join(' · ')}
-                          </span>
+                          {usageBar(k.buckets, true)}
+                          <div className="dshb-key-cost-counts">
+                            {TOKEN_SEGMENTS.map((seg) => t(seg.labelKey) + ' ' + fmtTokens(k.buckets[seg.key])).join(' · ')}
+                          </div>
                         </div>
                       )
                     })}
@@ -641,7 +642,7 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
               <table className="dshb-table dshb-price-table">
                 <thead>
                   <tr>
-                    <th className="dshb-price-corner" colSpan={3}>{t('priceModel')}</th>
+                    <th className="dshb-price-corner" colSpan={2}>{t('priceModel')}</th>
                     {prices.map((tier, i) => (
                       <th key={tier.id} className="dshb-price-head-cell">
                         <span className="dshb-price-model-name" title={tier.match === '*' ? t('fallbackHint') : undefined}>
@@ -652,12 +653,9 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
                   </tr>
                 </thead>
                 <tbody>
-                  {METRIC_GROUPS.map((group, gi) => (
+                  {METRIC_GROUPS.map((group) => (
                     <Fragment key={group.field}>
                       <tr>
-                        {gi === 0
-                          ? <th rowSpan={METRIC_GROUPS.length * 2} className="dshb-price-cat">{t('priceCategory')}<sup>(1)(2)</sup></th>
-                          : null}
                         <th rowSpan={2} className="dshb-price-metric">{t(group.labelKey)}</th>
                         <td className="dshb-price-period dshb-period-off">{t('pricePeriodOffPeak')}</td>
                         {prices.map((tier, i) => (
@@ -689,9 +687,7 @@ export function BalanceModal({ run, useOpen, close, getSession, useTick, useAuto
             </div>
           </div>
         )}
-      <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-        <button type="button" className="dshb-btn dshb-btn-small" onClick={restoreDefaults}>{t('restoreDefaults')}</button>
-        <span style={{ flex: 1 }} />
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
         <button type="button" className="dshb-btn dshb-btn-small dshb-btn-primary" disabled={prices === null}
           onClick={() => { if (prices !== null) void savePrices(prices) }}>{t('save')}</button>
       </div>

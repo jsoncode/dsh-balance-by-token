@@ -9,7 +9,7 @@
 import type { CredentialsService, SettingsScope, SettingsService } from './providers.ts'
 import { listDeepseekProviders, listProviderBaseUrls } from './providers.ts'
 import { queryBalances } from './balance.ts'
-import { computeCosts, DEFAULT_PRICE_CONFIG, normalizePriceConfig } from './cost.ts'
+import { computeCosts, normalizePriceConfig } from './cost.ts'
 import type { SessionLike } from './cost.ts'
 import type { ExtraKey, OpRequest, OpResult, PriceConfig, PriceTier } from './types.ts'
 
@@ -110,7 +110,7 @@ export async function runOp(deps: OpDeps, request: OpRequest): Promise<OpResult>
         return { ok: true, cost: result }
       }
       case 'pricesGet': {
-        return { ok: true, config: readPriceConfig(deps), defaults: DEFAULT_PRICE_CONFIG }
+        return { ok: true, config: readPriceConfig(deps) }
       }
       case 'pricesSave': {
         const raw = request.config

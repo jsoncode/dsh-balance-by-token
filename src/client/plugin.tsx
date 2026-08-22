@@ -6,8 +6,8 @@
  * 运行时经 factory 的 require 解析到宿主模块表（seed）。
  *
  * 入口结构（统一弹框）：
- * - sidebar.footer.action：常驻「余额」按钮（不声明 order，使用插槽默认
- *   排序），点击打开统一弹框；
+ * - sidebar.footer.action：常驻「余额」按钮（固定 order: 30，排在插槽
+ *   靠前位置），点击打开统一弹框；
  * - shell.overlay（dsh-balance-modal）：统一弹框，三个 tab —— 余额 / 费用 /
  *   价格设置，所有余额相关的显示与设置都收敛在此。
  */
@@ -96,11 +96,11 @@ export function createPlugin(): ClientPluginModule {
       } catch { /* 插槽未声明时静默降级（通用命令卡片渲染） */ }
 
       // ─── 侧边栏底部入口：常驻「余额」按钮（footer.action 区）─────────
-      //     一次注册，不声明 order（用插槽默认排序）、不订阅插槽变化：
+      //     一次注册，声明固定 order: 30、不订阅插槽变化：
       //     避免与其它动态排序插件形成互相触发的重注册死循环。styles.ts
       //     已把该列表容器改为纵向堆叠，多个按钮各占一行。
       slots.inject(FOOTER_SLOT, () => slots.register(
-        { name: FOOTER_SLOT, id: FOOTER_ENTRY_ID },
+        { name: FOOTER_SLOT, id: FOOTER_ENTRY_ID, order: 30 },
         (props: Record<string, unknown>) => (
           <FooterButton
             onOpen={() => modalStore.open(true)}

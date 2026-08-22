@@ -6,8 +6,8 @@
  * 运行时经 factory 的 require 解析到宿主模块表（seed）。
  *
  * 入口结构（统一弹框）：
- * - sidebar.footer.action：常驻「余额」按钮（不声明 order，使用插槽默认
- *   排序），点击打开统一弹框；
+ * - sidebar.footer.action：常驻「余额」按钮（固定 order: 30，排在插槽
+ *   靠前位置），点击打开统一弹框；
  * - shell.overlay（dsh-balance-modal）：统一弹框，三个 tab —— 余额 / 费用 /
  *   价格设置，所有余额相关的显示与设置都收敛在此。
  */

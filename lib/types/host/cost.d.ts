@@ -5,16 +5,21 @@
  * 1. 内存会话（ctx.sessions.get）：遍历 session.events，复刻官方 tokenUsage
  *    投影的折叠语义 —— 'assistant/chunk'(chunk.type==='usage') 提供早期样本，
  *    'assistant/message' 提供同一 (turn,step) 的最终样本，后值覆盖前值，
- *    不重复计费；'request/context' 追踪当前模型用于匹配价格档。
+ *    不重复计费；'request/context' 追踪当前模型与服务商用于匹配价格档。
  * 2. 今日磁盘聚合：扫描 dshHomePath('sessions')/<project>/<sessionId>/
  *    session.jsonl(.zstd)，mtime >= 今日零点粗筛 → zstd 解压（整包优先、
  *    多帧按魔数切分兜底）→ 首行 header 取 cwd → 只取 'assistant/message'
  *    且 time >= 今日零点的事件 → 按 (文件路径,mtime,size,今日零点) 记忆化。
  *
- * 计费（每百万 tokens 单价，按事件发生时刻匹配高峰/空闲时段）：
- * 时段判定：事件时间 → 配置时区偏移后的本地 HH:MM → 是否落在任一高峰窗口；
- * 其余时间为空闲时段。同一模型两套单价分别用于对应时段。
- * (uncachedInput*input + cacheRead*cacheRead + cacheWrite*cacheWrite + output*output) / 1e6
+ * 按 API key（服务商条目）分组统计：每个 provider（会话事件中的服务商路由，
+ * 对应一个 API key）各自累计 token 四桶 —— 不区分官方与否，一律只统计数量；
+ * 费用只对官方 key（baseURL 域名 == api.deepseek.com）按 模型 × 高峰/空闲时段
+ * 计费，非官方 key 金额恒为 0（展示为「不计费」）。
+ *
+ * 计费口径（每百万 tokens 单价）：时段判定：事件时间 → 配置时区偏移后的本地
+ * HH:MM → 是否落在任一高峰窗口；其余时间为空闲时段。同一模型两套单价分别用于
+ * 对应时段。(uncachedInput*input + cacheRead*cacheRead + cacheWrite*cacheWrite
+ * + output*output) / 1e6
  */
 import type { CostResult, PriceConfig, PricePeriodPrices, PriceTier, TimeWindow } from './types.ts';
 /** 默认时区偏移：北京时间 UTC+8（分钟）。 */

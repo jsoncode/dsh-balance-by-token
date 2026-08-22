@@ -4,7 +4,7 @@ A DeepSeek Harness plugin (dual-face: host + browser) for watching your DeepSeek
 account **balance** and estimating **token-based costs**, with prices configured
 per **model × peak/off-peak period** online. Everything lives in a unified modal
 (opened from the sidebar-footer **Balance** button); a **session-header** button
-shows a live "Session ≈xx CNY | Balance xx CNY". UI copy is bilingual
+shows a live "Session ≈xx CNY". UI copy is bilingual
 (Chinese / English, following the host UI language).
 
 [中文文档](README.md)
@@ -17,6 +17,9 @@ shows a live "Session ≈xx CNY | Balance xx CNY". UI copy is bilingual
   - entries from the host `llm-pi-ai` settings whose `baseURL` points at DeepSeek,
   - the official `llm-deepseek` route,
   - manually attached **extra API keys** (see below).
+- Each API key row shows "**Today spend ≈xx CNY | Balance xx CNY**"
+  (numbers green) — the key's own today cost (matched from the per-key cost
+  stats by provider route, ≈0.00 when unused) plus its account balance.
 - For each provider the plugin resolves the configured `apiKeyEnv` via the host
   `credentials` service and calls the official
   `GET https://api.deepseek.com/user/balance` (proxied by the host — keys never
@@ -27,17 +30,18 @@ shows a live "Session ≈xx CNY | Balance xx CNY". UI copy is bilingual
   from the modal (label + key, masked echo), persisted to
   `$DSH_HOME/settings.yaml`.
 
-### Cost tab — stacked-bar charts
+### Cost tab — per-API-key breakdown
 
 - Four cards: **Last turn / This session / Today · this project / Today · all**,
-  each with amount + a stacked bar + legend (input / cache read / cache write /
-  output — pure divs, no chart library).
-- **Token usage from all providers/models is counted**; **only DeepSeek official
-  requests (API domain api.deepseek.com) are billed** — other providers (e.g.
-  OpenRouter) are counted but not billed.
-- **Official and non-official are shown separately**: one bar for official (four
-  legend buckets), and a **list per non-official provider** (each with its own
-  mini bar + inline four-bucket counts, never merged).
+  each with the total billed amount + a stacked bar + legend (input / cache read /
+  cache write / output — pure divs, no chart library).
+- **Per API key rows**: inside every card, each configured key (provider route)
+  gets its own row showing its own four-bucket token counts, a mini bar, an
+  official/non-official chip and its own cost.
+- **Token usage is counted per key regardless of officialness**; **cost is only
+  computed for official keys** (API domain `api.deepseek.com`) — non-official keys
+  show a "not billed" chip instead of an amount. Multiple official keys (several
+  routes pointing at the official API) each get their own row and their own bill.
 - Official detection: the `provider` field of `request/context` events → that
   provider's baseURL in host settings → hostname equals `api.deepseek.com`
   (trailing slash / case normalized; lookalike domains such as
@@ -49,33 +53,33 @@ shows a live "Session ≈xx CNY | Balance xx CNY". UI copy is bilingual
 
 ### Price settings tab — official pricing-table layout
 
-- Strictly mirrors the official price table: `模型版本` (colspan=3) + one column
-  per model; `价格` (rowspan=6) + three metric groups (input cache-hit / cache-miss
-  / output, each rowspan=2) + off-peak/peak rows; **only the price cells are input
-  boxes** (peak red, off-peak green).
+- Mirrors the official price table layout minus the category column:
+  `模型版本` (colspan=2) + one column per model; three metric groups (input
+  cache-hit / cache-miss / output, each rowspan=2) + off-peak/peak rows;
+  **only the price cells are input boxes** (peak red, off-peak green).
 - Each model has **peak and off-peak** sets of four prices (per million tokens:
   input / cache read / cache write / output, CNY).
 - **Periods are configurable**: peak windows (cross-midnight supported) + a
   **timezone-offset slider** (UTC-12..+12, shown as 东八区 / 西五区 / 零时区).
   Official default: Beijing 9:00–12:00 & 14:00–18:00 are peak; off-peak = peak × 0.5.
-- Ships with the official V4 tiers (`deepseek-v4-flash` / `deepseek-v4-pro` /
-  `deepseek-v4-flash-vision-exp`) and "restore official defaults". Old flat-format
+- Built-in fallback is the official V4 tiers (`deepseek-v4-flash` /
+  `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`). Old flat-format
   config migrates automatically on first read (legacy built-in defaults upgrade to
   the official three tiers).
 
 ### Session-header live button
 
 - Registered on `conversation.session.header.utilities`, showing
-  **Session ≈xx CNY | Balance xx CNY** (amounts green).
+  **Session ≈xx CNY** (amount green) — the current session's estimated cost only.
 - **Clicking the button refreshes once**; auto-refreshes at the configured interval;
   refreshes on session switch.
 
 ### Entry button (sidebar footer)
 
-- `sidebar.footer.action` **Balance** button in a pin-shape layout (left
-  "余额", right two lines: amount + period). It shows **高峰时段** (red) or
-  **空闲时段 半价** (green) depending on the current time; the amount comes from
-  the balance API.
+- `sidebar.footer.action` **Balance** button with horizontal right-side text:
+  "余额(110.00 CNY) 高峰时段" — the amount in parentheses right after the label,
+  then the period text. It shows **高峰时段** (red) or **空闲时段 半价** (green)
+  depending on the current time; the amount comes from the balance API.
 
 ### Auto refresh
 

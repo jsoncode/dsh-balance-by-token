@@ -5,23 +5,28 @@
  * 1. 内存会话（ctx.sessions.get）：遍历 session.events，复刻官方 tokenUsage
  *    投影的折叠语义 —— 'assistant/chunk'(chunk.type==='usage') 提供早期样本，
  *    'assistant/message' 提供同一 (turn,step) 的最终样本，后值覆盖前值，
- *    不重复计费；'request/context' 追踪当前模型用于匹配价格档。
+ *    不重复计费；'request/context' 追踪当前模型与服务商用于匹配价格档。
  * 2. 今日磁盘聚合：扫描 dshHomePath('sessions')/<project>/<sessionId>/
  *    session.jsonl(.zstd)，mtime >= 今日零点粗筛 → zstd 解压（整包优先、
  *    多帧按魔数切分兜底）→ 首行 header 取 cwd → 只取 'assistant/message'
  *    且 time >= 今日零点的事件 → 按 (文件路径,mtime,size,今日零点) 记忆化。
  *
- * 计费（每百万 tokens 单价，按事件发生时刻匹配高峰/空闲时段）：
- * 时段判定：事件时间 → 配置时区偏移后的本地 HH:MM → 是否落在任一高峰窗口；
- * 其余时间为空闲时段。同一模型两套单价分别用于对应时段。
- * (uncachedInput*input + cacheRead*cacheRead + cacheWrite*cacheWrite + output*output) / 1e6
+ * 按 API key（服务商条目）分组统计：每个 provider（会话事件中的服务商路由，
+ * 对应一个 API key）各自累计 token 四桶 —— 不区分官方与否，一律只统计数量；
+ * 费用只对官方 key（baseURL 域名 == api.deepseek.com）按 模型 × 高峰/空闲时段
+ * 计费，非官方 key 金额恒为 0（展示为「不计费」）。
+ *
+ * 计费口径（每百万 tokens 单价）：时段判定：事件时间 → 配置时区偏移后的本地
+ * HH:MM → 是否落在任一高峰窗口；其余时间为空闲时段。同一模型两套单价分别用于
+ * 对应时段。(uncachedInput*input + cacheRead*cacheRead + cacheWrite*cacheWrite
+ * + output*output) / 1e6
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
-import type { CostEntry, CostResult, PriceConfig, PricePeriodPrices, PriceTier, TimeWindow, UsageBuckets } from './types.ts'
+import type { CostEntry, CostResult, KeyCostEntry, PriceConfig, PricePeriodPrices, PriceTier, TimeWindow, UsageBuckets } from './types.ts'
 
 /** 默认时区偏移：北京时间 UTC+8（分钟）。 */
 export const DEFAULT_TIMEZONE_OFFSET_MINUTES = 480
@@ -104,29 +109,29 @@ interface StepSample {
   time?: number
 }
 
+/** 今日扫描中单个服务商（API key）的聚合桶。 */
+interface ProviderToday {
+  /** 全部 token（不区分官方与否，仅统计数量）：高峰/空闲时段桶。 */
+  peak: UsageBuckets
+  offPeak: UsageBuckets
+  /** 官方计费用：model -> 时段四桶（仅官方 provider 填充）。 */
+  billable: Map<string, { peak: UsageBuckets; offPeak: UsageBuckets }>
+}
+
 /** 今日扫描中单个日志文件的聚合结果（记忆化缓存的载荷）。 */
 interface FileTodaySample {
   cwd?: string
-  /**
-   * model -> 四份桶：全部用量（peak/offPeak）用于统计数量，
-   * 官方用量（officialPeak/officialOffPeak）用于按模型计费。
-   */
-  byModel: Map<string, {
-    peak: UsageBuckets
-    offPeak: UsageBuckets
-    officialPeak: UsageBuckets
-    officialOffPeak: UsageBuckets
-  }>
-  /** 官方（api.deepseek.com）合计用量（展示用，跨模型汇总）。 */
-  officialTotal: { peak: UsageBuckets; offPeak: UsageBuckets }
-  /** 非官方按服务商拆分：provider -> 时段桶（只统计数量）。 */
-  nonOfficialByProvider: Map<string, { peak: UsageBuckets; offPeak: UsageBuckets }>
+  /** 服务商路由 key -> 聚合桶。 */
+  byProvider: Map<string, ProviderToday>
 }
 
 const zeroBuckets = (): UsageBuckets => ({ uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 })
 
 const numberOr = (v: unknown, fallback = 0): number =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback
+
+/** 金额保留 6 位小数（与 token 单价的每百万口径精度匹配）。 */
+const round6 = (v: number): number => Math.round(v * 1e6) / 1e6
 
 /** usage -> 四桶（与官方 bucketsFrom 一致：cacheRead/cacheWrite 缺省 0）。 */
 function bucketsFrom(usage: UsageLike): UsageBuckets {
@@ -312,44 +317,37 @@ function costOf(buckets: UsageBuckets, period: PricePeriodPrices | undefined): n
   ) / 1_000_000
 }
 
-function entryOf(
-  official: UsageBuckets,
-  nonOfficialByProvider: Array<{ provider: string; buckets: UsageBuckets }>,
-  amount: number,
-  currency: string,
-): CostEntry {
-  const all = { ...official }
-  for (const item of nonOfficialByProvider) addBuckets(all, item.buckets)
-  return {
-    amount: Math.round(amount * 1e6) / 1e6,
-    currency,
-    buckets: all,
-    official: { ...official },
-    // 去掉全零项（provider 已知但无 token 的不展示）。
-    nonOfficialByProvider: nonOfficialByProvider
-      .map((item) => ({ provider: item.provider, buckets: { ...item.buckets } }))
-      .filter((item) => totalTokens(item.buckets) > 0),
-  }
-}
-
 /** 一个桶的总 token 数（四桶之和）。 */
 function totalTokens(buckets: UsageBuckets): number {
   return buckets.uncachedInput + buckets.cacheRead + buckets.cacheWrite + buckets.output
 }
 
-/** 逐桶相减：all − official（四桶分别算，不合并）。 */
-function subtractBuckets(all: UsageBuckets, official: UsageBuckets): UsageBuckets {
-  return {
-    uncachedInput: all.uncachedInput - official.uncachedInput,
-    cacheRead: all.cacheRead - official.cacheRead,
-    cacheWrite: all.cacheWrite - official.cacheWrite,
-    output: all.output - official.output,
+/**
+ * 把 per-key 分组折算成 CostEntry：
+ * token 合计（所有 key，不区分官方与否）+ 计费金额合计（仅官方 key）。
+ * 全零分组剔除；byKey 按 token 总数降序。
+ */
+function assembleEntry(groups: Iterable<KeyCostEntry>): CostEntry {
+  const buckets = zeroBuckets()
+  let amount = 0
+  let currency = 'CNY'
+  const byKey: KeyCostEntry[] = []
+  for (const group of groups) {
+    if (totalTokens(group.buckets) <= 0) continue
+    addBuckets(buckets, group.buckets)
+    byKey.push({ provider: group.provider, buckets: { ...group.buckets }, official: group.official, amount: group.amount, currency: group.currency })
+    if (group.official) {
+      amount += group.amount
+      if (group.currency !== '') currency = group.currency
+    }
   }
+  byKey.sort((a, b) => totalTokens(b.buckets) - totalTokens(a.buckets))
+  return { amount: round6(amount), currency, buckets, byKey }
 }
 
 /**
  * 折叠内存会话事件为 per-(turn,step) 样本表（官方投影语义：后值覆盖前值）。
- * 同时追踪每个样本所属模型（取样本之前最近一次 request/context 的 model）与时间。
+ * 同时追踪每个样本所属模型与服务商（取样本之前最近一次 request/context）与时间。
  */
 function foldSessionEvents(events: readonly SessionEventLike[]): { samples: Map<string, StepSample>; maxTurn: number } {
   const samples = new Map<string, StepSample>()
@@ -386,8 +384,8 @@ function foldSessionEvents(events: readonly SessionEventLike[]): { samples: Map<
 }
 
 /**
- * 对一组样本聚合：官方（api.deepseek.com）单独成桶并计费；
- * 非官方按服务商（provider）分别成桶、只统计数量，多条并存。
+ * 对一组样本按 API key（provider）分组统计：全部 token 分别累计（不区分官方与否）；
+ * 官方 key（api.deepseek.com）额外按模型 × 时段计费，非官方金额恒为 0。
  */
 function priceSamples(
   samples: Iterable<StepSample>,
@@ -395,37 +393,32 @@ function priceSamples(
   config: PriceConfig,
   modelOnly: string | undefined,
   providerBaseUrls: Record<string, string>,
-): {
-  amount: number
-  currency: string
-  official: UsageBuckets
-  nonOfficialByProvider: Array<{ provider: string; buckets: UsageBuckets }>
-} {
-  const official = zeroBuckets()
-  const nonOfficialByProvider = new Map<string, UsageBuckets>()
-  let amount = 0
-  let currency = 'CNY'
+): { byKey: KeyCostEntry[] } {
+  const groups = new Map<string, { buckets: UsageBuckets; official: boolean; amount: number; currency: string }>()
   for (const sample of samples) {
-    if (isOfficialProvider(sample.provider, providerBaseUrls)) {
-      addBuckets(official, sample.buckets)
+    const key = typeof sample.provider === 'string' && sample.provider.length > 0 ? sample.provider : 'unknown'
+    let group = groups.get(key)
+    if (group === undefined) {
+      // 同一 provider 的 baseURL 固定，官方属性对首个样本判定一次即可。
+      group = { buckets: zeroBuckets(), official: isOfficialProvider(sample.provider, providerBaseUrls), amount: 0, currency: '' }
+      groups.set(key, group)
+    }
+    addBuckets(group.buckets, sample.buckets)
+    if (group.official) {
       const model = modelOnly !== undefined ? modelOnly : sample.model
       const tier = matchTier(model, prices)
-      if (tier !== undefined) currency = tier.currency
-      amount += costOf(sample.buckets, tier === undefined ? undefined : periodPricesOf(tier, sample.time ?? Date.now(), config))
-    } else {
-      // 非官方（含 provider 缺失/未登记）：按服务商 key 分别累计。
-      const key = typeof sample.provider === 'string' && sample.provider.length > 0 ? sample.provider : 'unknown'
-      const target = nonOfficialByProvider.get(key) ?? zeroBuckets()
-      addBuckets(target, sample.buckets)
-      nonOfficialByProvider.set(key, target)
+      if (tier !== undefined) group.currency = tier.currency
+      group.amount += costOf(sample.buckets, tier === undefined ? undefined : periodPricesOf(tier, sample.time ?? Date.now(), config))
     }
   }
-  return {
-    amount,
-    currency,
-    official,
-    nonOfficialByProvider: [...nonOfficialByProvider.entries()].map(([provider, buckets]) => ({ provider, buckets })),
-  }
+  const byKey: KeyCostEntry[] = [...groups.entries()].map(([provider, g]) => ({
+    provider,
+    buckets: { ...g.buckets },
+    official: g.official,
+    amount: round6(g.amount),
+    currency: g.currency,
+  }))
+  return { byKey }
 }
 
 /**
@@ -457,15 +450,15 @@ export async function computeCosts(
       sessionModel,
       providerBaseUrls,
     )
-    : { amount: 0, currency: 'CNY', official: zeroBuckets(), nonOfficialByProvider: [] }
+    : { byKey: [] as KeyCostEntry[] }
 
-  // 今日两项：磁盘日志扫描（金额按各文件记录的模型 + 时段 + 官方服务商分别匹配价格档后求和）。
+  // 今日两项：磁盘日志扫描（官方 key 的金额按各文件记录的模型 + 时段分别匹配价格档后求和）。
   const today = await scanToday(currentCwd, config, providerBaseUrls)
   const tier = matchTier(sessionModel, config.tiers)
 
   return {
-    lastTurn: entryOf(lastTurnPriced.official, lastTurnPriced.nonOfficialByProvider, lastTurnPriced.amount, lastTurnPriced.currency),
-    session: entryOf(sessionPriced.official, sessionPriced.nonOfficialByProvider, sessionPriced.amount, sessionPriced.currency),
+    lastTurn: assembleEntry(lastTurnPriced.byKey),
+    session: assembleEntry(sessionPriced.byKey),
     todayProject: today.project,
     todayAll: today.all,
     ...sessionModel === undefined ? {} : { sessionTier: sessionModel + ' → ' + (tier?.name ?? '?') },
@@ -491,7 +484,7 @@ function decodeLog(path: string, isZstd: boolean): string | undefined {
   } catch {
     return undefined
   }
-  if (!isZstd) return raw.toString('utf8')
+  if (isZstd === false) return raw.toString('utf8')
   // 扫描帧魔数边界，逐帧解压拼接（与官方 PublicZstdFrameDecoder 同语义；
   // 单帧文件扫描结果为 1 帧，与一次性 API 等价）。
   const starts: number[] = []
@@ -515,9 +508,9 @@ function decodeLog(path: string, isZstd: boolean): string | undefined {
 }
 
 /**
- * 解析一个日志文件中今日的用量（header cwd + assistant/message 桶，按时段拆分）。
- * 所有服务商的 token 都统计数量；DeepSeek 官方（api.deepseek.com）的用量
- * 额外计入 official 桶用于计费。
+ * 解析一个日志文件中今日的用量（header cwd + assistant/message 桶，
+ * 按 API key 分组、组内按时段拆分）。所有 key 的 token 都统计数量；
+ * 官方 key（api.deepseek.com）的用量额外进入 billable 按模型计费。
  */
 function parseTodayFile(
   path: string,
@@ -528,11 +521,7 @@ function parseTodayFile(
 ): FileTodaySample | undefined {
   const text = decodeLog(path, isZstd)
   if (text === undefined) return undefined
-  const sample: FileTodaySample = {
-    byModel: new Map(),
-    officialTotal: { peak: zeroBuckets(), offPeak: zeroBuckets() },
-    nonOfficialByProvider: new Map(),
-  }
+  const sample: FileTodaySample = { byProvider: new Map() }
   let currentModel: string | undefined
   let currentProvider: string | undefined
   let first = true
@@ -564,26 +553,21 @@ function parseTodayFile(
     const usage = data?.usage
     if (usage === undefined) continue
     const model = currentModel ?? '*'
-    const pair = sample.byModel.get(model) ?? {
-      peak: zeroBuckets(),
-      offPeak: zeroBuckets(),
-      officialPeak: zeroBuckets(),
-      officialOffPeak: zeroBuckets(),
+    const providerKey = typeof currentProvider === 'string' && currentProvider.length > 0 ? currentProvider : 'unknown'
+    let provider = sample.byProvider.get(providerKey)
+    if (provider === undefined) {
+      provider = { peak: zeroBuckets(), offPeak: zeroBuckets(), billable: new Map() }
+      sample.byProvider.set(providerKey, provider)
     }
     const peak = isPeakTime(parsed.time, config)
     const usageBuckets = bucketsFrom(usage)
-    addBuckets(peak ? pair.peak : pair.offPeak, usageBuckets)
+    addBuckets(peak ? provider.peak : provider.offPeak, usageBuckets)
     if (isOfficialProvider(currentProvider, providerBaseUrls)) {
-      addBuckets(peak ? pair.officialPeak : pair.officialOffPeak, usageBuckets)
-      addBuckets(peak ? sample.officialTotal.peak : sample.officialTotal.offPeak, usageBuckets)
-    } else {
-      // 非官方：按服务商分别累计（provider 缺失/未登记归入 unknown）。
-      const key = typeof currentProvider === 'string' && currentProvider.length > 0 ? currentProvider : 'unknown'
-      const providerPair = sample.nonOfficialByProvider.get(key) ?? { peak: zeroBuckets(), offPeak: zeroBuckets() }
-      addBuckets(peak ? providerPair.peak : providerPair.offPeak, usageBuckets)
-      sample.nonOfficialByProvider.set(key, providerPair)
+      // 仅官方 key 进入计费桶（按模型拆分以匹配价格档）。
+      const pair = provider.billable.get(model) ?? { peak: zeroBuckets(), offPeak: zeroBuckets() }
+      addBuckets(peak ? pair.peak : pair.offPeak, usageBuckets)
+      provider.billable.set(model, pair)
     }
-    sample.byModel.set(model, pair)
   }
   return sample
 }
@@ -600,26 +584,20 @@ function todayStartMs(): number {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
 }
 
-/** 按 (model, 时段) 的官方桶折算金额与币种（仅官方计费）。 */
-function costByModel(
-  byModel: Map<string, {
-    peak: UsageBuckets
-    offPeak: UsageBuckets
-    officialPeak: UsageBuckets
-    officialOffPeak: UsageBuckets
-  }>,
-  config: PriceConfig,
-): { amount: number; currency: string } {
-  let amount = 0
-  let currency = 'CNY'
-  for (const [model, pair] of byModel) {
-    const tier = matchTier(model === '*' ? undefined : model, config.tiers)
-    if (tier !== undefined) currency = tier.currency
-    const now = Date.now()
-    amount += costOf(pair.officialPeak, tier === undefined ? undefined : periodPricesOf(tier, now, config))
-    amount += costOf(pair.officialOffPeak, tier === undefined ? undefined : tier.offPeak)
+/** 把一个文件的 per-provider 聚合并入目标映射（跨文件合并）。 */
+function mergeProviderToday(target: Map<string, ProviderToday>, source: Map<string, ProviderToday>): void {
+  for (const [provider, pt] of source) {
+    const t = target.get(provider) ?? { peak: zeroBuckets(), offPeak: zeroBuckets(), billable: new Map() }
+    addBuckets(t.peak, pt.peak)
+    addBuckets(t.offPeak, pt.offPeak)
+    for (const [model, pair] of pt.billable) {
+      const b = t.billable.get(model) ?? { peak: zeroBuckets(), offPeak: zeroBuckets() }
+      addBuckets(b.peak, pair.peak)
+      addBuckets(b.offPeak, pair.offPeak)
+      t.billable.set(model, b)
+    }
+    target.set(provider, t)
   }
-  return { amount, currency }
 }
 
 /**
@@ -632,10 +610,7 @@ async function scanToday(
   config: PriceConfig,
   providerBaseUrls: Record<string, string>,
 ): Promise<{ project: CostEntry; all: CostEntry }> {
-  const empty = {
-    project: entryOf(zeroBuckets(), [], 0, 'CNY'),
-    all: entryOf(zeroBuckets(), [], 0, 'CNY'),
-  }
+  const empty = { project: assembleEntry([]), all: assembleEntry([]) }
   const todayStart = todayStartMs()
   let root: string
   try {
@@ -649,23 +624,8 @@ async function scanToday(
   } catch {
     return empty
   }
-  const projectByModel = new Map<string, {
-    peak: UsageBuckets
-    offPeak: UsageBuckets
-    officialPeak: UsageBuckets
-    officialOffPeak: UsageBuckets
-  }>()
-  const allByModel = new Map<string, {
-    peak: UsageBuckets
-    offPeak: UsageBuckets
-    officialPeak: UsageBuckets
-    officialOffPeak: UsageBuckets
-  }>()
-  // 官方合计（展示）与非官方按服务商（展示）。
-  const projectOfficialTotal = { peak: zeroBuckets(), offPeak: zeroBuckets() }
-  const allOfficialTotal = { peak: zeroBuckets(), offPeak: zeroBuckets() }
-  const projectNonOfficial = new Map<string, { peak: UsageBuckets; offPeak: UsageBuckets }>()
-  const allNonOfficial = new Map<string, { peak: UsageBuckets; offPeak: UsageBuckets }>()
+  const allByProvider = new Map<string, ProviderToday>()
+  const projectByProvider = new Map<string, ProviderToday>()
   for (const project of projects) {
     const projectDirPath = join(root, project)
     let sessionIds: string[]
@@ -707,77 +667,37 @@ async function scanToday(
         }
         if (sample === undefined) continue
         const isProject = sample.cwd !== undefined && samePath(sample.cwd, currentCwd)
-        // 官方合计与非官方按服务商：并入 全部 与（若属于本项目）本项目。
-        const foldProvider = (
-          targetOfficial: { peak: UsageBuckets; offPeak: UsageBuckets },
-          targetNonOfficial: Map<string, { peak: UsageBuckets; offPeak: UsageBuckets }>,
-        ): void => {
-          addBuckets(targetOfficial.peak, sample.officialTotal.peak)
-          addBuckets(targetOfficial.offPeak, sample.officialTotal.offPeak)
-          for (const [provider, providerPair] of sample.nonOfficialByProvider) {
-            const t = targetNonOfficial.get(provider) ?? { peak: zeroBuckets(), offPeak: zeroBuckets() }
-            addBuckets(t.peak, providerPair.peak)
-            addBuckets(t.offPeak, providerPair.offPeak)
-            targetNonOfficial.set(provider, t)
-          }
-        }
-        foldProvider(allOfficialTotal, allNonOfficial)
-        if (isProject) foldProvider(projectOfficialTotal, projectNonOfficial)
-        for (const [model, pair] of sample.byModel) {
-          const allTarget = allByModel.get(model) ?? {
-            peak: zeroBuckets(),
-            offPeak: zeroBuckets(),
-            officialPeak: zeroBuckets(),
-            officialOffPeak: zeroBuckets(),
-          }
-          addBuckets(allTarget.peak, pair.peak)
-          addBuckets(allTarget.offPeak, pair.offPeak)
-          addBuckets(allTarget.officialPeak, pair.officialPeak)
-          addBuckets(allTarget.officialOffPeak, pair.officialOffPeak)
-          allByModel.set(model, allTarget)
-          if (isProject) {
-            const projectTarget = projectByModel.get(model) ?? {
-              peak: zeroBuckets(),
-              offPeak: zeroBuckets(),
-              officialPeak: zeroBuckets(),
-              officialOffPeak: zeroBuckets(),
-            }
-            addBuckets(projectTarget.peak, pair.peak)
-            addBuckets(projectTarget.offPeak, pair.offPeak)
-            addBuckets(projectTarget.officialPeak, pair.officialPeak)
-            addBuckets(projectTarget.officialOffPeak, pair.officialOffPeak)
-            projectByModel.set(model, projectTarget)
-          }
-        }
+        mergeProviderToday(allByProvider, sample.byProvider)
+        if (isProject) mergeProviderToday(projectByProvider, sample.byProvider)
         break
       }
     }
   }
-  const assemble = (
-    byModel: Map<string, {
-      peak: UsageBuckets
-      offPeak: UsageBuckets
-      officialPeak: UsageBuckets
-      officialOffPeak: UsageBuckets
-    }>,
-    officialTotal: { peak: UsageBuckets; offPeak: UsageBuckets },
-    nonOfficial: Map<string, { peak: UsageBuckets; offPeak: UsageBuckets }>,
-  ): CostEntry => {
-    const priced = costByModel(byModel, config)
-    const official = zeroBuckets()
-    addBuckets(official, officialTotal.peak)
-    addBuckets(official, officialTotal.offPeak)
-    const nonOfficialList: Array<{ provider: string; buckets: UsageBuckets }> = []
-    for (const [provider, pair] of nonOfficial) {
+  const assemble = (byProvider: Map<string, ProviderToday>): CostEntry => {
+    const groups: KeyCostEntry[] = []
+    for (const [provider, pt] of byProvider) {
       const buckets = zeroBuckets()
-      addBuckets(buckets, pair.peak)
-      addBuckets(buckets, pair.offPeak)
-      nonOfficialList.push({ provider, buckets })
+      addBuckets(buckets, pt.peak)
+      addBuckets(buckets, pt.offPeak)
+      const official = isOfficialProvider(provider, providerBaseUrls)
+      let amount = 0
+      let currency = ''
+      if (official) {
+        // 与旧口径一致：高峰桶按当前时刻判定的时段单价、空闲桶按空闲单价。
+        const now = Date.now()
+        for (const [model, pair] of pt.billable) {
+          const tier = matchTier(model === '*' ? undefined : model, config.tiers)
+          if (tier !== undefined) currency = tier.currency
+          amount += costOf(pair.peak, tier === undefined ? undefined : periodPricesOf(tier, now, config))
+          amount += costOf(pair.offPeak, tier === undefined ? undefined : tier.offPeak)
+        }
+      }
+      groups.push({ provider, buckets, official, amount: round6(amount), currency })
     }
-    return entryOf(official, nonOfficialList, priced.amount, priced.currency)
+    return assembleEntry(groups)
   }
   return {
-    project: assemble(projectByModel, projectOfficialTotal, projectNonOfficial),
-    all: assemble(allByModel, allOfficialTotal, allNonOfficial),
+    project: assemble(projectByProvider),
+    all: assemble(allByProvider),
   }
 }

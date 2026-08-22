@@ -1,6 +1,6 @@
 /**
  * dsh-balance-by-token —— 会话头部工具区按钮（conversation.session.header.utilities）：
- * 【当前会话xxCNY/余额xxxCNY】—— 实时显示当前会话费用与账户余额。
+ * 【当前会话 ≈xx CNY】—— 只实时显示当前会话的预估费用。
  * 点击按钮立即刷新一次；启用「定时更新」后按设定间隔自动刷新。
  */
 import type { RunFn } from '../rpc.ts';
