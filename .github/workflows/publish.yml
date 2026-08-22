@@ -22,7 +22,6 @@ jobs:
               with:
                   node-version: 26
                   package-manager-cache: false
-                  # 🌟 修复：移除这里的 registry-url，防止全局 Token 污染导致 npx 报 403
 
             - name: Install dependencies
               run: npx --yes pnpm@10.33.0 install --frozen-lockfile
@@ -50,8 +49,8 @@ jobs:
                     *.tgz
 
             - name: Publish to npm via Token
-                # 🌟 修复：通过 --registry 显式指定源，并在 env 中用局部注入的方式完成发布
-              run: npm publish --registry=https://npmjs.org --no-git-checks
+                # 🌟 核心修复：1. 修正为官方标准发布源 2. 保留不进行本地 git 检查的参数
+              run: npm publish --registry=https://registry.npmjs.org/ --no-git-checks
               env:
-                  # 这样 Token 只会在执行 npm publish 这单行命令时生效，绝不干扰前面的 npx
+                  # 仅在这一行安全注入你在 GitHub Secrets 填写的、拥有 Bypass 2FA 权限的密匙
                   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
