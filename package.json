@@ -51,7 +51,7 @@
     "cordis.patch.yml",
     "assets/logo.svg",
     "README.md",
-    "README.en.md"
+    "README.zh-CN.md"
   ],
   "dsh": {
     "bundle": {
