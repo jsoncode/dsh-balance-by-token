@@ -1,6 +1,10 @@
 # 发布工作流：推送 v* tag 时触发
-# - release job：安装依赖（pnpm frozen-lockfile）+ 类型检查（tsc -b）+ 构建（tsc -b && tsdown）
-#   → 打包并直接创建 GitHub Release（非草稿）→ 自动通过带有 Bypass 2FA 权限的传统 Token 发布至 npm
+# - release job：安装依赖（pnpm frozen-lockfile）+ 类型检查（tsc -b）+ 构建（tsc -b && tsdown）→ 打包并直接创建 GitHub Release（非草稿）→ 自动通过 OIDC 凭证发布至 npm
+#
+# 注意：setup-node@v5 必须显式关闭 package-manager-cache（默认开启会读取
+# package.json 的 packageManager 字段并执行 `pnpm store path`，而该步骤执行时
+# pnpm 尚未安装，node 26 不再捆绑 corepack，导致 "Unable to locate executable
+# file: pnpm"）。pnpm 由后续步骤经 npx 临时调用，无需缓存恢复。
 name: Publish
 
 on:
@@ -13,6 +17,7 @@ jobs:
         runs-on: ubuntu-latest
         permissions:
             contents: write   # 用于创建 GitHub Release
+            id-token: write   # 必须！用于通过 OIDC 与 npm 进行身份安全验证
         steps:
             - name: Checkout
               uses: actions/checkout@v5
@@ -24,6 +29,7 @@ jobs:
                   package-manager-cache: false
 
             - name: Install dependencies
+                # 用 npx 直接调用 pnpm：版本与 package.json 的 packageManager 字段一致。
               run: npx --yes pnpm@10.33.0 install --frozen-lockfile
 
             - name: Type check
@@ -48,9 +54,6 @@ jobs:
                     --verify-tag \
                     *.tgz
 
-            - name: Publish to npm via Token
-                # 🌟 核心修复：1. 修正为官方标准发布源 2. 保留不进行本地 git 检查的参数
-              run: npm publish --registry=https://registry.npmjs.org/ --no-git-checks
-              env:
-                  # 仅在这一行安全注入你在 GitHub Secrets 填写的、拥有 Bypass 2FA 权限的密匙
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+            - name: Publish to npm via Trusted Publishing
+                # --provenance 将发布行为绑定到工作流凭证；--no-git-checks 跳过工作区检查。
+              run: npm publish --provenance --no-git-checks
